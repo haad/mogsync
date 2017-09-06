@@ -3,7 +3,7 @@
 # This file will read list of keys from $1 and fetch them from local mogilefs server and
 # then upload them to different mogilefs server at $2
 #
-# mogilefs-sync.py -r 10.3.16.102:7001 -l localhost:6001 -d reality.sk -f /srv/backup/mogile/backup_diff_1503647724
+# /usr/local/bin/mogsync.py -r 10.3.16.102:7001 -l localhost:6001 -d reality.sk -j 1 -f /srv/backup/mogile/backup_diff_1504259996
 #
 # diff file
 #
@@ -11,6 +11,8 @@
 #
 
 import os
+import signal
+import sys
 import csv
 import subprocess
 import argparse
@@ -21,14 +23,21 @@ import tempfile
 from multiprocessing import Pool
 
 import retrying
+from retrying import retry
 
 from pymogile import Client, MogileFSError
 
 BASE_PATH='/dev/shm/'
+BASE_BACKUP_FILE='/srv/backup/mogile/base_backup'
+
+def signal_handler(signal, frame):
+        logging.info('Mogsync tool exiting')
+        sys.exit(0)
 
 class MogSync(object):
-    def __init__(self, domain, rnode, lnode):
+    def __init__(self, domain, rnode, lnode, threads):
         self.domain = domain
+        self.threads = threads
 
         self.rnode = rnode
         self.rclient = self.get_mogile_client(rnode)
@@ -37,27 +46,39 @@ class MogSync(object):
         self.lclient = self.get_mogile_client(lnode)
 
 
-    @retry(wait_fixed=2000, stop_max_attempt_number=5)
+    @retry(wait_fixed=2000, stop_max_attempt_number=3)
     def get_mogile_client(self, node):
-        logging.debug('Initializing mogilefs client for domain: %s, tracker: %s', domain, node)
-        return Client(domain=self.domain, trackers=[node])
+        ''' Initialize Mogilefs client against given node:port combination '''
+        logging.debug('Initializing mogilefs client for domain: %s, tracker: %s', self.domain, node)
+        client = Client(domain=self.domain, trackers=[node])
 
-    @retry(wait_fixed=2000, stop_max_attempt_number=5)
+        # Test if we can execute simple request on mogilefs server
+        if client.sleep(1):
+            logging.info('Successfuly connected to mogilefs server %s', node)
+            return client
+        else:
+            raise Exception('Connection to mogilefs server {} failed'.format(node))
+
+    @retry(wait_fixed=1000, stop_max_attempt_number=3)
     def fetch_mogile_file(self, client, key, path):
         ''' Fetch key from a client and save it to file path '''
-        logging.debug('Fetching key: %s to a file: %s from tracker %s:%s', key, path,
-                      client.last_tracker[0], client.last_tracker[1])
+        logging.debug('Fetching key: %s to a file: %s from tracker %s', key, path,
+                      client.last_tracker)
         file_data = client.read_file(key)
-        with open(path, 'a') as mogfile:
-            mogfile.write(file_data.read())
 
-        file_data.close()
+        if file_data:
+            with open(path, 'a') as mogfile:
+                mogfile.write(file_data.read())
+
+            file_data.close()
+        else:
+            raise Exception('Fetching key: {0} failed retrying...'.format(key))
 
     @retry(wait_fixed=2000, stop_max_attempt_number=5)
     def upload_mogile_file(self, client, key, path):
         ''' Upload file located on path as a key on a mogilefs server defined by client '''
-        logging.debug('Uploading file: %s as a key: %s to tracker %s:%s', path, key,
-                      client.last_tracker[0], client.last_tracker[1])
+        logging.debug('Uploading file: %s as a key: %s to tracker %s', path, key,
+                      client.last_tracker)
         fp = client.new_file(key)
         with open(path, 'r') as mogfile:
             fp.write(mogfile.read())
@@ -76,12 +97,23 @@ class MogSync(object):
         tmppath = tempfile.mkdtemp(prefix=BASE_PATH)
         os.chdir(tmppath)
 
-        self.fetch_mogile_file(self.lclient, key, file_name)
-        self.upload_mogile_file(self.rclient, key, file_name)
-        self.unlink_mogile_file(file_name)
+        try:
+            self.fetch_mogile_file(self.lclient, key, file_name)
+            self.upload_mogile_file(self.rclient, key, file_name)
+            self.unlink_mogile_file(file_name)
+        except:
+            logging.error('Syncing file %s failed...', key)
 
         os.rmdir(tmppath)
         return key
+
+    def go(self, keys):
+        p = Pool(self.threads)
+        logging.info(p.map(self, keys))
+
+    def __call__(self, x):
+        return self.sync_mogile_file(x)
+
 
 def load_keys_from_file(key_file):
     ''' Load keys from file and extract them to array '''
@@ -91,6 +123,13 @@ def load_keys_from_file(key_file):
         keys = [row[1] for row in csv.reader(mogfile, delimiter=';')]
 
     return keys
+
+def update_base_backup(key_file):
+    ''' update base_backup file to newer version '''
+    fn = key_file.split('/')[-1]
+    with open(BASE_BACKUP_FILE, 'w') as bfile:
+         bfile.write(fn)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -111,22 +150,22 @@ def main():
 
     args = parser.parse_args()
 
+    signal.signal(signal.SIGINT, signal_handler)
+
     numeric_level = getattr(logging, args.loglevel.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError('Invalid log level: %s' % args.loglevel)
     logging.basicConfig(level=numeric_level, filename=args.log_file)
-
-    mogsync = MogSync(args.domain, args.rnode, args.lnode)
 
     if not os.path.isfile(args.file):
         logging.error('File containing list of keys to sync is missing %s', args.file)
 
     keys = load_keys_from_file(args.file)
 
-    p = Pool(args.threads)
-    print(p.map(mogsync.sync_mogile_file, keys))
+    mogsync = MogSync(args.domain, args.remote_node, args.local_node, args.threads)
+    mogsync.go(keys)
 
-
+    update_base_backup(args.file)
 
 if __name__ == "__main__":
     main()

@@ -35,7 +35,7 @@ def signal_handler(signal, frame):
         sys.exit(0)
 
 class MogSync(object):
-    def __init__(self, domain, rnode, lnode, threads):
+    def __init__(self, domain, rnode, lnode, threads, verify):
         self.domain = domain
         self.threads = threads
 
@@ -45,6 +45,7 @@ class MogSync(object):
         self.lnode = lnode
         self.lclient = self.get_mogile_client(lnode)
 
+        self.verify = verify
 
     @retry(wait_fixed=2000, stop_max_attempt_number=3)
     def get_mogile_client(self, node):
@@ -94,6 +95,12 @@ class MogSync(object):
         file_name = key.split('/')[-1]
         logging.debug('Running sync on key: %s', key)
 
+        #
+        # verify flag means that we will check if file is present on
+        # remote server and only if it is not we will upload.
+        if self.verify and self.rclient.get_paths(key):
+            return key
+
         tmppath = tempfile.mkdtemp(prefix=BASE_PATH)
         os.chdir(tmppath)
 
@@ -124,6 +131,7 @@ def load_keys_from_file(key_file):
 
     return keys
 
+
 def update_base_backup(key_file):
     ''' update base_backup file to newer version '''
     fn = key_file.split('/')[-1]
@@ -147,6 +155,8 @@ def main():
                         help='Set logging level to given string.')
     parser.add_argument("--log-file", type=str, default='/tmp/mogsync.log',
                         help='Set log file path.')
+    parser.add_argument("-V", "--verify", type=bool, default=False,
+                        help='Verify if file is present on remote location first then fetch/upload files.')
 
     args = parser.parse_args()
 
@@ -160,9 +170,10 @@ def main():
     if not os.path.isfile(args.file):
         logging.error('File containing list of keys to sync is missing %s', args.file)
 
+    mogsync = MogSync(args.domain, args.remote_node, args.local_node, args.threads, args.verify)
+
     keys = load_keys_from_file(args.file)
 
-    mogsync = MogSync(args.domain, args.remote_node, args.local_node, args.threads)
     mogsync.go(keys)
 
     update_base_backup(args.file)
